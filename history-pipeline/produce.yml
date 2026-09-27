@@ -1,0 +1,77 @@
+name: Produce video
+
+on:
+  schedule:
+    # Two videos a day. Times are UTC: 05:07 and 11:07 UTC = about 6am and 12pm UK summer time.
+    # Delete one line for one video a day.
+    - cron: "7 5 * * *"
+    - cron: "7 11 * * *"
+  workflow_dispatch:   # adds a "Run workflow" button so you can make one any time
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: pipeline-state
+  cancel-in-progress: false
+
+jobs:
+  produce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install ffmpeg and fonts
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
+
+      - name: Install Python packages
+        run: pip install -r requirements.txt
+
+      - name: Make the video
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
+        run: python main.py produce
+
+      - name: Name the download
+        id: name
+        run: echo "slug=video-$(date -u +%Y%m%d-%H%M)" >> "$GITHUB_OUTPUT"
+
+      - name: Save the video for download
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.name.outputs.slug }}
+          path: |
+            out/video.mp4
+            out/thumbnail.jpg
+            out/captions.srt
+            out/UPLOAD.txt
+            out/script.txt
+            out/pinned_comment.txt
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 0
+
+      - name: Open a "Ready to upload" issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "" >> out/issue.md
+          echo "**Download:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} (Artifacts section at the bottom; kept for 7 days)" >> out/issue.md
+          gh label create ready-to-upload --color 2EA043 2>/dev/null || true
+          gh issue create --title "$(cat out/issue_title.txt)" --body-file out/issue.md --label ready-to-upload
+
+      - name: Save state and archive
+        run: |
+          git config user.name "history-pipeline"
+          git config user.email "actions@users.noreply.github.com"
+          git add state archive
+          git diff --cached --quiet || git commit -m "Produced video $(date -u +%F\ %H:%M)"
+          git pull --rebase && git push
