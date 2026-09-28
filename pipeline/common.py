@@ -72,6 +72,7 @@ def ask_claude(cfg: dict, system: str, user_content, *, web_search: int = 0,
     tools = []
     if web_search:
         tools.append({"type": "web_search_20250305", "name": "web_search", "max_uses": web_search})
+    import anthropic
     messages = [{"role": "user", "content": user_content}]
     for attempt in range(6):
         try:
@@ -79,12 +80,16 @@ def ask_claude(cfg: dict, system: str, user_content, *, web_search: int = 0,
                           system=system, messages=messages)
             if tools:
                 kwargs["tools"] = tools
-            resp = claude().messages.create(**kwargs)
-        except Exception as e:  # rate limits / overload: back off and retry
+            # Streaming is required for long responses (big scripts).
+            with claude().messages.stream(**kwargs) as stream:
+                resp = stream.get_final_message()
+        except (anthropic.RateLimitError, anthropic.InternalServerError,
+                anthropic.APIConnectionError, anthropic.APITimeoutError) as e:
             wait = 20 * (attempt + 1)
-            log(f"Claude call failed ({e}); retrying in {wait}s")
+            log(f"Claude busy ({e}); retrying in {wait}s")
             time.sleep(wait)
             continue
+        # Anything else (bad key, no credit, wrong model name) stops straight away with a clear error.
         if resp.stop_reason == "pause_turn":
             # long web-search turns: hand the partial turn back and continue
             messages = [messages[0], {"role": "assistant", "content": resp.content}]
