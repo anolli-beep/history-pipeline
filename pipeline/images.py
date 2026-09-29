@@ -84,7 +84,13 @@ def _download(url: str, dest: Path) -> bool:
     try:
         r = requests.get(url, headers=UA, timeout=90)
         r.raise_for_status()
-        img = Image.open(io.BytesIO(r.content)).convert("RGB")
+        img = Image.open(io.BytesIO(r.content))
+        if img.mode in ("RGBA", "LA", "P"):  # transparent PNGs (e.g. SVG maps) go on white
+            img = img.convert("RGBA")
+            bg = Image.new("RGB", img.size, (255, 255, 255))
+            bg.paste(img, mask=img.split()[-1])
+            img = bg
+        img = img.convert("RGB")
         if img.width < 800:
             return False
         img.save(dest, "JPEG", quality=92)
@@ -175,5 +181,107 @@ def find_images(cfg: dict, script: dict, out_dir: Path) -> dict:
     script["image_credits"] = list(credits.values())
     report = {"requested": n, "missed": misses,
               "miss_rate": round(misses / max(n, 1), 2), "unique_images": len(credits)}
+    log(f"Images: {report}")
+    return report
+
+
+# ------------------------------------------------------------------------------------------
+# Plan mode: images were chosen in the Claude chat (by exact Commons file name or a specific
+# search). No Claude API calls here: we only look the files up, check the licence and download.
+# ------------------------------------------------------------------------------------------
+def _info_from_page(cfg: dict, p: dict) -> dict | None:
+    info = (p.get("imageinfo") or [{}])[0]
+    meta = info.get("extmetadata", {})
+    lic = meta.get("LicenseShortName", {}).get("value", "")
+    if not info or not licence_ok(cfg, lic):
+        return None
+    mime = info.get("mime")
+    # SVG maps are fine: Commons gives us a PNG rendering of them (thumburl).
+    if mime not in ("image/jpeg", "image/png", "image/tiff", "image/webp") and not (
+            mime == "image/svg+xml" and info.get("thumburl")):
+        return None
+    return {
+        "title": p.get("title", "").replace("File:", ""),
+        "url": info.get("thumburl") or info.get("url"),
+        "page": info.get("descriptionurl"),
+        "licence": lic,
+        "artist": _strip_html(meta.get("Artist", {}).get("value", ""))[:120] or "Unknown",
+        "width": info.get("width", 0),
+    }
+
+
+def file_info(cfg: dict, name: str) -> dict | None:
+    """Look up one Commons file by name, e.g. 'File:Bayeux Tapestry scene 57.jpg'."""
+    name = name if name.lower().startswith("file:") else f"File:{name}"
+    params = {"action": "query", "format": "json", "titles": name, "prop": "imageinfo",
+              "iiprop": "url|size|mime|extmetadata", "iiurlwidth": 2560, "redirects": 1}
+    try:
+        r = requests.get(COMMONS, params=params, headers=UA, timeout=40)
+        r.raise_for_status()
+    except requests.RequestException as e:
+        log(f"Commons lookup failed for {name}: {e}")
+        return None
+    for p in (r.json().get("query", {}).get("pages", {}) or {}).values():
+        if "missing" in p:
+            log(f"Not on Commons: {name}")
+            return None
+        c = _info_from_page(cfg, p)
+        if c is None:
+            log(f"Skipped (licence/format): {name}")
+        return c
+    return None
+
+
+def resolve_plan_images(cfg: dict, script: dict, out_dir: Path) -> dict:
+    """Each shot in the plan has either "file" (exact Commons file) or "query" (a search).
+    Downloads them, records credits, and fills gaps so every scene has at least one image."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    used: set[str] = set()
+    credits: dict[str, dict] = {}
+    requested = missed = 0
+    for si, scene in enumerate(script["scenes"]):
+        shots = []
+        for qi, want in enumerate(scene.get("shots", [])):
+            requested += 1
+            cands = []
+            if want.get("file"):
+                c = file_info(cfg, want["file"])
+                if c:
+                    cands.append(c)
+            if not cands and want.get("query"):
+                cands = [c for c in search_commons(cfg, want["query"]) if c["title"] not in used]
+            got = None
+            for ci, c in enumerate(cands[:3]):
+                if c["title"] in used:
+                    continue
+                dest = out_dir / f"s{si:03d}_{qi}_{ci}.jpg"
+                if dest.exists() or _download(c["url"], dest):
+                    got = (c, dest)
+                    break
+            if not got:
+                missed += 1
+                continue
+            c, dest = got
+            used.add(c["title"])
+            credits[c["title"]] = c
+            shots.append({"path": str(dest), "caption": want.get("caption", ""), "title": c["title"]})
+        scene["shots"] = shots
+        log(f"Scene {si + 1}/{len(script['scenes'])}: {len(shots)} images")
+
+    last = None
+    for scene in script["scenes"]:
+        if scene["shots"]:
+            last = scene["shots"]
+        elif last:
+            scene["shots"] = [dict(s, caption="") for s in last[-1:]]
+    first = next((s["shots"] for s in script["scenes"] if s["shots"]), None)
+    if not first:
+        raise RuntimeError("None of the plan's images could be found on Wikimedia Commons")
+    for scene in script["scenes"]:
+        if not scene["shots"]:
+            scene["shots"] = [dict(first[0], caption="")]
+    script["image_credits"] = list(credits.values())
+    report = {"requested": requested, "missed": missed,
+              "miss_rate": round(missed / max(requested, 1), 2), "unique_images": len(credits)}
     log(f"Images: {report}")
     return report
