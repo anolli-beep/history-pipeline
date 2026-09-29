@@ -1,0 +1,112 @@
+name: Render videos from plans
+
+# Runs whenever you upload plan files (written in the Claude chat) into the plans/ folder.
+# Uses ElevenLabs and Wikimedia only: no Claude API, so no Anthropic console credits.
+on:
+  push:
+    paths:
+      - "plans/*.json"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: render
+  cancel-in-progress: false
+
+jobs:
+  list:
+    runs-on: ubuntu-latest
+    outputs:
+      plans: ${{ steps.list.outputs.plans }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: list
+        run: |
+          plans=$(ls plans/*.json 2>/dev/null | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "plans=${plans:-[]}" >> "$GITHUB_OUTPUT"
+          echo "Plans to render: ${plans:-none}"
+
+  render:
+    needs: list
+    if: ${{ needs.list.outputs.plans != '[]' && needs.list.outputs.plans != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        plan: ${{ fromJSON(needs.list.outputs.plans) }}
+    name: ${{ matrix.plan }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install ffmpeg and fonts
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
+      - run: pip install -r requirements.txt
+
+      - name: Make the video
+        env:
+          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
+        run: python main.py render "${{ matrix.plan }}"
+
+      - name: Save the video for download
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-${{ github.run_number }}-${{ strategy.job-index }}
+          path: |
+            out/video.mp4
+            out/thumbnail.jpg
+            out/captions.srt
+            out/UPLOAD.txt
+            out/script.txt
+            out/pinned_comment.txt
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 0
+
+      - name: Open a "Ready to upload" issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "" >> out/issue.md
+          echo "**Download:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}. In the Artifacts section at the bottom, download **video-${{ github.run_number }}-${{ strategy.job-index }}** (kept for 7 days)." >> out/issue.md
+          gh label create ready-to-upload --color 2EA043 2>/dev/null || true
+          gh issue create --title "$(cat out/issue_title.txt)" --body-file out/issue.md --label ready-to-upload
+
+      - name: Mark this plan as done
+        run: echo "${{ matrix.plan }}" > done.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: done-${{ github.run_number }}-${{ strategy.job-index }}
+          path: done.txt
+          retention-days: 1
+
+  # Move finished plans to plans/done/ so they aren't rendered again. Failed ones stay for a retry.
+  tidy:
+    needs: [list, render]
+    if: ${{ always() && needs.list.outputs.plans != '[]' && needs.list.outputs.plans != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: done-${{ github.run_number }}-*
+          path: done
+      - name: Move finished plans
+        run: |
+          mkdir -p plans/done
+          for f in done/*/done.txt; do
+            [ -f "$f" ] || continue
+            p=$(cat "$f")
+            [ -f "$p" ] && git mv "$p" plans/done/
+          done
+          git config user.name "history-pipeline"
+          git config user.email "actions@users.noreply.github.com"
+          git diff --cached --quiet || git commit -m "Rendered plans (run ${{ github.run_number }}) [skip ci]"
+          git pull --rebase && git push
